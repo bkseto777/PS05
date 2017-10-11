@@ -1,6 +1,6 @@
 ---
 title: "STAT/MATH 495: Problem Set 05"
-author: "WRITE YOUR NAME HERE"
+author: "Brendan, Leonard, Vickie"
 date: "2017-10-11"
 output:
   html_document:
@@ -10,17 +10,21 @@ output:
     collapsed: false
     smooth_scroll: false
     df_print: kable
+    code_fold: hide
 ---
-
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
   echo = TRUE, fig.width=8, fig.height=4.5, message=FALSE, warning = FALSE
   )
 set.seed(76)
-
 # Load packages
+library(MASS)
 library(tidyverse)
+library(lubridate)
+library(pander)
+library(cowplot)
+library(latex2exp)
+
 
 # Note the relative file path, and not absolute file path:
 train <- read_csv("data/train.csv")
@@ -28,30 +32,129 @@ test <- read_csv("data/test.csv")
 sample_submission <- read_csv("data/sampleSubmission.csv")
 ```
 
-
-# Collaboration
-
-Please indicate who you collaborated with on this assignment:
-
-
 # Exploratory Data Analysis
 
-Information on the competition can be found [here](https://www.kaggle.com/c/bike-sharing-demand).
+## Dependent variable: Count
+Our first step was to look at the dependent variable: Count.  We saw that it was very skewed, so we decided to transform it.  We found out that the optimal lambda for a Box-Cox transform to be $0.30303$, therefore we settled on raising Count to the power of $\frac{1}{3}$.  The transformation can be seen below.  
 
-```{r}
+```{r, warning=FALSE, message=FALSE}
+#Box-Cox Transformation
+bc <- boxcox(count ~ 1, data=train)
+op <- par(pty = "s", mfrow = c(1,2))
+par(op)
+lamda <- bc$x[which.max(bc$y)] #lamda (ideal power) is 0.30303
 
+
+# Graphs
+before <- ggplot(train, aes(count))+geom_histogram()+
+  theme_bw()+
+  labs(title="No Transformation", x = "Count")
+after <- ggplot(train, aes((count)^(1/3)))+geom_histogram()+
+  theme_bw()+
+  xlab(TeX('Count^{ $\\frac{1}{3}$ }'))+
+  ggtitle("Transformed")
+
+# Make presentation pretty
+p <- plot_grid(before, after)
+title <- ggdraw() + draw_label("Rental Counts Data Exploration: Transform!", fontface='bold')
+plot_grid(title, p, ncol=1, rel_heights=c(0.1, 1))
 ```
 
+## Extract Time Variable
+
+```{r}
+train <- train %>% mutate(hour = as.character(hour(datetime)), day = as.character(weekdays(datetime)))
+```
+
+Our first step was to introduce two new variables from the time stamp, hour of the day and day of the week.  Note that hour is a categorical variable, not numerical.  That is because 1 and 24 are more similar than 1 and 12, it's not a linear quantity. 
+
+It's always nice to have more information and these may be especially helpful since most of the other data is about weather. Thus, they may add another dimension that is useful for prediction.  
+
+## Univariate Analyses
+
+Next we screened for those variables that actually describe something about the data.  It's no use talking about the variables that have nothing to do with the Count.  To do this, we ran each variable as a univariate predictor of Count, then indicated which ones were significant at an alpha = 0.2 (\*) and alpha = 0.05 (\*\*). The table below shows variable name, associated p-value and a significance indicator.  
+
+```{r}
+# Univariate Analyses 
+alpha = 0.2
+sig <- data.frame(Variable = "",Count = NA,sigCount="")
+for(i in c(2:9,13:14)){
+  # Get Variable Name
+  name <- colnames(train)[i]
+  # create model
+  diff <- lm((train$count)^(1/3)~unlist(train[,i]))
+  diff <- summary(diff)$coefficients
+  
+  s <- data.frame(Variable = name, Count = round(diff[2,4],2))
+  s <- mutate(s,sigCount = ifelse(Count<alpha, ifelse(Count<0.05,"**","*"),""))
+  sig <- rbind(sig,s)
+}
+sig[-1,]
+```
+
+We then took the significant variables and looked at their inter-correlation. Since we know that they all describe the data in some way, this should allow us to find those that inform us of different aspects.  
+
+```{r}
+important <- train %>% select(season, weather, temp, atemp, humidity, windspeed)
+
+pander(cor(important))
+```
+The variables with the lowest correlation appear to be {weather, atemp, windspeed}.  We're also going to include {season, weather, hour}, because season and weather have a very low correlation and we're pretty sure that hour is important and independent from the other two variables.  It may not be independent of atemp so we won't use it in the other group (and we'd be over the limit if we included it).  We could have done a fancy function to identify the pairs that have the lowest sum of correlations... but it's fairly simple to tell with just a cursory glance.   We'll test both of these sets.  
 
 # Model Fit
 
 ```{r}
-
+set.seed(77)
+mtrain <- train %>% 
+  sample_n(round(nrow(train)*0.8,0))
+mtest <- train %>% 
+  anti_join(mtrain, by="datetime")
 ```
 
+## Model 1: {season, weather, hour}
+
+```{r}
+m1 <- lm(count^(1/3)~season+weather+hour, data=mtrain)
+pander(summary(m1))
+```
+
+## Model 2: {weather, atemp, windspeed}
+```{r}
+m2 <- lm(count^(1/3)~atemp+weather+windspeed, data=mtrain)
+pander(summary(m2))
+```
+
+Just from this we can see that the first model will probably be better ($>R^2$), but let's do predictions for both.  
+
+## Model 3: {season, day, hour}
+
+```{r}
+m3 <- lm(count^(1/3)~season+day+hour, data=mtrain)
+pander(summary(m3))
+```
+
+Using just the time variables, we have almost the same $R^2$ as the season, weather and hour.  Thus we may not even need to bother to collect the weather data.  Of course, this is all predicated on the idea that we can only use 3 predictors.  If we could use more it'd probably help.  Note that day didn't appear significant until we transformed the count variable.  Interesting.  
+
+## Predictions
+
+```{r}
+p <- mtest %>% mutate(predict1 = predict(m1, newdata=mtest), predict2 = predict(m2, newdata=mtest), predict3 = predict(m3, newdata=mtest))
+RMSLE <- p %>% mutate(e1 = predict1^3-count, sle1 = log(e1)^2, 
+                      e2 = predict2^3-count, sle2 =log(e2)^2,
+                      e3 = predict3^3-count, sle3 =log(e3)^2) %>% 
+  summarise(RMSLE1 = sqrt(mean(sle1, na.rm=TRUE)), RMSLE2 = sqrt(mean(sle2, na.rm=TRUE)), RMSLE3 = sqrt(mean(sle3, na.rm=TRUE)))
+RMSLE
+```
+
+The best score came from the time we didn't use weather at all, indicating that it may not even be that important.  Of course this is if we only use three variables.  
 
 # Create Submission File
 
 ```{r}
-
+test <- test %>% mutate(hour = as.character(hour(datetime)), day = weekdays(datetime))
+submission <- test %>% mutate(count = predict(m1, newdata=test)) %>% 
+  select(datetime, count)
+write.csv(submission, "submission.csv")
 ```
+
+![Kaggle Submission.](kaggleScore.png)
